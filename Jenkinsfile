@@ -28,6 +28,7 @@ if (!['hr', 'finance', 'legal', 'digital', 'devops'].contains(department)) {
 
 def gitopsRepo  = "github.com/elevy99927-demos/gitops.git"
 def gitopsFile  = "systems/${department}/${envName}/${user}.yaml"
+def grafanaUrl  = "http://ac696a865f9c94253a85fb16d04e5e6e-1202293038.eu-west-1.elb.amazonaws.com"
 
 podTemplate(containers: [
       containerTemplate(name: 'jnlp', image: 'jenkins/inbound-agent', ttyEnabled: true),
@@ -113,10 +114,16 @@ podTemplate(containers: [
             }
         }
 
-        stage('add-dashboard') {
+                stage('add-dashboard') {
             container('deployer') {
+                // the dashboard is a ConfigMap in the chart (chart/templates/dashboard.yaml), so the deploy
+                // stage already committed it to gitops; Argo CD deploys it and Grafana's sidecar loads it
                 sh """
-                    echo " TBD: Add dashboard to grafana"
+                    if grep -q 'grafana_dashboard' "gitops/${gitopsFile}"; then
+                        echo "Dashboard committed. Open ${grafanaUrl} -> Dashboards -> TaxCalc (${user})"
+                    else
+                        echo "No dashboard in ${gitopsFile}: build with SERVICE_MONITOR checked to add it"
+                    fi
                 """
             }
         }
