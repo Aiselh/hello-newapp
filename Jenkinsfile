@@ -1,27 +1,105 @@
-def appname = "hello-newapp"
-def repo = "elevy99927"  // Replace with your DockerHub username
-def appimage = "${repo}/${appname}"
-def apptag = "${env.BUILD_NUMBER}"
+// GitOps flow: build the image (docker-in-docker), push tags <BUILD_NUMBER> + latest,
+// render the Helm chart, and commit the rendered manifests to
+//   https://github.com/elevy99927-demos/gitops  ->  systems/<DEPARTMENT>/<ENV>/<user>.yaml
+// Argo CD (ApplicationSet/systems-manifests.yaml) deploys that file.
+
+
+
+def user        = "aidentale2"              // your name: Docker Hub user AND gitops file name
+def appname     = "taxcalc"
+def appimage    = "${user}/${appname}"      // docker.io/<user>/helloworld
+def apptag      = "${env.BUILD_NUMBER}"
+def envName     = "dev"
+def department  = "legal"
+
+def gitopsRepo  = "github.com/elevy99927-demos/gitops.git"
+def gitopsFile  = "systems/${department}/${envName}/${user}.yaml"
 
 podTemplate(containers: [
       containerTemplate(name: 'jnlp', image: 'jenkins/inbound-agent', ttyEnabled: true),
-      containerTemplate(name: 'docker', image: 'docker:dind', command: 'cat', ttyEnabled: true, privileged: true)
-  ])
-  {
+      containerTemplate(name: 'deployer', image: 'elevy99927/k8s-deployer:latest', command: 'cat', ttyEnabled: true),
+      // docker-in-docker: this container runs dockerd; the sh steps below run the docker CLI in it
+      containerTemplate(name: 'docker', image: 'docker:27-dind', privileged: true,
+                        args: '--storage-driver=vfs',
+                        envVars: [envVar(key: 'DOCKER_TLS_CERTDIR', value: '')])   // no TLS inside the pod
+  ])  {
+    // Credentials come from Jenkins (Manage Jenkins -> Credentials), not from Kubernetes secrets:
+    //   docker-cred  : Username with password - <user> + Docker Hub access token
+    //   github-token : Username with password - elevy99927-demos + GitHub token (write access to gitops)
     node(POD_LABEL) {
-        stage('chackout') {
+        stage('checkout') {
             container('jnlp') {
-            sh '/usr/bin/git config --global http.sslVerify false'
-	    checkout scm
-          }
-        } // end chackout
+                sh '/usr/bin/git config --global http.sslVerify false'
+                checkout scm
+            }
+        }
 
         stage('build') {
             container('docker') {
-              echo "Building docker image..."
-              sh "echo docker push $appimage"
+                // wait for dockerd (started by the dind container) to accept connections
+                sh '''
+                    for i in $(seq 1 3); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done
+                    echo "docker daemon did not start"; docker info; exit 1
+                '''
+                echo "Building ${appimage}:${apptag}"
+                // quote the workspace: job names with spaces give paths with spaces
+                sh "docker build -t ${appimage}:${apptag} -t ${appimage}:latest \"${env.WORKSPACE}\""
             }
-        } //end build
-    }
-}
+        }
 
+        stage('push') {
+            container('docker') {
+                // TAGS: <BUILD_NUMBER> (immutable, deployed by GitOps) and latest
+                withCredentials([usernamePassword(credentialsId: 'docker-cred', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_TOKEN')]) {
+                    sh """
+                        set -e
+                        echo "\$DOCKER_TOKEN" | docker login -u "\$DOCKER_USER" --password-stdin
+                        docker push ${appimage}:${apptag}
+                        docker push ${appimage}:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        stage('deploy') {
+            container('deployer') {
+                echo "Rendering chart into ${gitopsRepo} -> ${gitopsFile}"
+                withCredentials([usernamePassword(credentialsId: 'github-token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                sh """#!/bin/sh
+                    set -e
+                    command -v git >/dev/null || apk add --no-cache git
+
+                    rm -rf gitops
+                    git clone https://\${GIT_USER}:\${GIT_TOKEN}@${gitopsRepo} gitops
+                    cd gitops
+                    git config user.name  "Jenkins (${user})"
+                    git config user.email "elevy99927-demos@users.noreply.github.com"
+
+                    helm template ${user} "${env.WORKSPACE}/chart" \\
+                        --set image.repository=${appimage} \\
+                        --set image.tag=${apptag} \\
+                        > ${gitopsFile}
+
+                    git add ${gitopsFile}
+                    if git diff --cached --quiet; then
+                        echo "No changes in ${gitopsFile} - nothing to deploy"
+                        exit 0
+                    fi
+                    git commit -m "Deploy ${appimage}:${apptag} to ${department}/${envName} (build ${env.BUILD_NUMBER}) \n Commited by ${user}"
+
+                    git push origin HEAD:main
+                """
+                }
+            }
+        }
+
+        stage('add-dashboard') {
+            container('deployer') {
+                sh """
+                    echo " TBD: Add dashboard to grafana"
+                """
+            }
+        }
+    }
+  }
