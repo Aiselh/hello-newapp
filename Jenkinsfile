@@ -3,14 +3,28 @@
 //   https://github.com/elevy99927-demos/gitops  ->  systems/<DEPARTMENT>/<ENV>/<user>.yaml
 // Argo CD (ApplicationSet/systems-manifests.yaml) deploys that file.
 
-
+properties([
+  parameters([
+    choice(name: 'ENV', choices: ['dev', 'qa', 'prd'], description: 'Environment folder: systems/<DEPARTMENT>/<ENV>/'),
+    string(name: 'DEPARTMENT', defaultValue: 'devops', description: 'Department folder: hr, finance, legal, digital, devops'),
+    booleanParam(name: 'SERVICE_MONITOR', defaultValue: false, description: 'Render the ServiceMonitor (needs the Prometheus Operator CRDs in the cluster)'),
+    choice(name: 'DIND_STORAGE_DRIVER', choices: ['overlay2', 'vfs'], description: 'dind storage driver: overlay2 (fast). Use vfs only if overlay2 fails on your nodes (slow, uses more disk)')
+  ])
+])
 
 def user        = "aidentale2"              // your name: Docker Hub user AND gitops file name
 def appname     = "taxcalc"
 def appimage    = "${user}/${appname}"      // docker.io/<user>/helloworld
 def apptag      = "${env.BUILD_NUMBER}"
-def envName     = "dev"
-def department  = "legal"
+def envName     = params.ENV ?: 'dev'
+def department  = params.DEPARTMENT?.trim() ?: 'legal'
+def serviceMon  = params.SERVICE_MONITOR ? 'true' : 'false'
+def storageDrv  = params.DIND_STORAGE_DRIVER ?: 'overlay2' 
+
+// DEPARTMENT is free text: stop typos before they become a new gitops folder
+if (!['hr', 'finance', 'legal', 'digital', 'devops'].contains(department)) {
+    error "DEPARTMENT must be one of: hr, finance, legal, digital, devops (got '${department}')"
+}
 
 def gitopsRepo  = "github.com/elevy99927-demos/gitops.git"
 def gitopsFile  = "systems/${department}/${envName}/${user}.yaml"
@@ -20,8 +34,12 @@ podTemplate(containers: [
       containerTemplate(name: 'deployer', image: 'elevy99927/k8s-deployer:latest', command: 'cat', ttyEnabled: true),
       // docker-in-docker: this container runs dockerd; the sh steps below run the docker CLI in it
       containerTemplate(name: 'docker', image: 'docker:27-dind', privileged: true,
-                        args: '--storage-driver=vfs',
+                        args: "--storage-driver=${storageDrv}",
                         envVars: [envVar(key: 'DOCKER_TLS_CERTDIR', value: '')])   // no TLS inside the pod
+            ],
+  volumes: [
+      // docker's data on the node's real disk: overlay2 works there (not on top of the container's overlayfs)
+      emptyDirVolume(mountPath: '/var/lib/docker', memory: false)
   ])  {
     // Credentials come from Jenkins (Manage Jenkins -> Credentials), not from Kubernetes secrets:
     //   docker-cred  : Username with password - <user> + Docker Hub access token
@@ -79,6 +97,7 @@ podTemplate(containers: [
                     helm template ${user} "${env.WORKSPACE}/chart" \\
                         --set image.repository=${appimage} \\
                         --set image.tag=${apptag} \\
+                        --set serviceMonitor.enabled=${serviceMon} \\
                         > ${gitopsFile}
 
                     git add ${gitopsFile}
